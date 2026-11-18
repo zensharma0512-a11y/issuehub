@@ -57,3 +57,17 @@ class IdempotencyConflict(IssueHubError):
 
     code = "idempotency_key_reused"
     http_status = 422
+
+
+class StorageUnavailable(IssueHubError):
+    """The database can't be reached right now. Safe for the client to retry."""
+
+    code = "storage_unavailable"
+    http_status = 503
+
+
+class StorageError(IssueHubError):
+    """Any other database failure. Never exposes driver details to clients."""
+
+    code = "storage_error"
+    http_status = 500

@@ -11,8 +11,8 @@ BOB = {"Authorization": "Bearer t-bob"}
 
 
 @pytest.fixture
-def api():
-    adapter = HttpAdapter(IssueService(), StaticTokenAuth({"t-alice": "alice", "t-bob": "bob"}))
+def api(make_service):
+    adapter = HttpAdapter(make_service(), StaticTokenAuth({"t-alice": "alice", "t-bob": "bob"}))
 
     def call(method, path, body=None, headers=None, query=None):
         raw = json.dumps(body).encode() if body is not None else None
@@ -73,8 +73,8 @@ def test_comment_thread_over_http(api):
 
 
 @pytest.mark.parametrize("raw", [b"not json", b"[1,2]", b'{"title": 5}', b"\xff\xfe"])
-def test_bad_bodies_are_400(raw):
-    adapter = HttpAdapter(IssueService(), StaticTokenAuth({"t": "u"}))
+def test_bad_bodies_are_400(raw, make_service):
+    adapter = HttpAdapter(make_service(), StaticTokenAuth({"t": "u"}))
     adapter.handle("POST", "/projects", headers={"Authorization": "Bearer t"},
                    body=json.dumps({"id": "p", "name": "P"}).encode())
     status, _, body = adapter.handle(
@@ -89,16 +89,16 @@ def test_unknown_route_and_wrong_method(api):
     assert status == 405 and headers["Allow"] == "GET, POST"
 
 
-def test_non_member_gets_404_not_403(api):
-    adapter = HttpAdapter(IssueService(), StaticTokenAuth({"a": "alice", "m": "mallory"}))
+def test_non_member_gets_404_not_403(api, make_service):
+    adapter = HttpAdapter(make_service(), StaticTokenAuth({"a": "alice", "m": "mallory"}))
     adapter.handle("POST", "/projects", headers={"Authorization": "Bearer a"},
                    body=json.dumps({"id": "secret", "name": "S"}).encode())
     status, _, _ = adapter.handle("GET", "/projects/secret/issues", headers={"Authorization": "Bearer m"})
     assert status == 404
 
 
-def test_flask_app_end_to_end():
-    adapter = HttpAdapter(IssueService(), StaticTokenAuth({"t": "alice"}))
+def test_flask_app_end_to_end(make_service):
+    adapter = HttpAdapter(make_service(), StaticTokenAuth({"t": "alice"}))
     client = create_app(adapter).test_client()
     auth = {"Authorization": "Bearer t"}
     assert client.post("/projects", json={"id": "web", "name": "W"}, headers=auth).status_code == 201
@@ -106,3 +106,17 @@ def test_flask_app_end_to_end():
     assert r.status_code == 201 and r.get_json()["id"] == 1
     r = client.get("/projects/web/issues/1", headers=auth)
     assert r.status_code == 200 and r.headers["ETag"] == '"1"'
+
+
+def test_storage_outage_is_503():
+    from issuehub.errors import StorageUnavailable
+
+    class Down:
+        def __getattr__(self, name):
+            def fail(*a, **k):
+                raise StorageUnavailable("storage is temporarily unavailable")
+            return fail
+
+    adapter = HttpAdapter(IssueService(Down()), StaticTokenAuth({"t": "alice"}))
+    status, _, body = adapter.handle("GET", "/projects/web/issues", headers={"Authorization": "Bearer t"})
+    assert status == 503 and body["error"] == "storage_unavailable"

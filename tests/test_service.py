@@ -17,8 +17,8 @@ from issuehub import (
 
 
 @pytest.fixture
-def svc():
-    s = IssueService()
+def svc(make_service):
+    s = make_service()
     s.create_project("alice", "web", "Website")
     s.add_member("alice", "web", "bob", "member")
     s.add_member("alice", "web", "vera", "viewer")
@@ -327,8 +327,8 @@ class TestSnapshots:
         again, _ = svc.create_issue("bob", "web", "Bug", idempotency_key="k")
         assert again["title"] == "Bug"
 
-    def test_services_do_not_share_state(self):
-        a, b = IssueService(), IssueService()
+    def test_services_do_not_share_state(self, make_service):
+        a, b = make_service(), make_service()
         a.create_project("alice", "web", "A")
         b.create_project("alice", "web", "B")  # no AlreadyExists: separate instances
         a.create_issue("alice", "web", "only in a")

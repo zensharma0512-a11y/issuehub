@@ -91,7 +91,11 @@ class HttpAdapter:
                 "message": "method not allowed",
             }
         except IssueHubError as exc:
-            extra = {"WWW-Authenticate": "Bearer"} if exc.http_status == 401 else {}
+            extra = {}
+            if exc.http_status == 401:
+                extra["WWW-Authenticate"] = "Bearer"
+            if exc.http_status == 503:
+                extra["Retry-After"] = "2"
             return exc.http_status, extra, exc.to_dict()
         except Exception:  # never leak internals to clients
             log.exception("unhandled error")

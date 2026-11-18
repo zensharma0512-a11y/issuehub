@@ -1,13 +1,15 @@
-"""IssueHub core service.
+"""IssueHub core service: validation and authorisation on top of a ``Store``.
 
 Design notes
 ------------
-* Every project owns its own lock, so traffic on one project never blocks another.
-  A small registry lock only guards creating/looking up projects.
-* All mutations validate fully *before* touching state, so a failed call leaves
-  no partial writes (no half-created issue, no stored idempotency key).
-* Callers only ever receive freshly built dicts; internal records are never
-  handed out, so mutating a result cannot corrupt the store.
+* Every mutation is validated in full *before* the store is called, so a failed
+  call leaves no partial writes (no issue, no stored idempotency key, no used
+  number).
+* The atomic parts (number allocation, idempotent create, version-checked status
+  change) live in the store: ``MemoryStore`` uses per-project locks,
+  ``MongoStore`` uses single-document atomic updates and unique indexes.
+* Callers only ever receive freshly built dicts, so mutating a result cannot
+  corrupt stored state.
 * Non-members get ``NotFound`` for a project, so the API does not reveal which
   project IDs exist.
 """
@@ -18,22 +20,19 @@ import base64
 import binascii
 import hashlib
 import json
-import threading
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable
 
 from . import validation as v
 from .errors import (
-    AlreadyExists,
-    IdempotencyConflict,
     InvalidTransition,
     NotFound,
     PermissionDenied,
     ValidationError,
     VersionConflict,
 )
+from .store import MemoryStore, Store
 
 
 class Role(str, Enum):
@@ -62,95 +61,17 @@ TRANSITIONS: dict[Status, frozenset[Status]] = {
 MAX_PAGE_SIZE = 100
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@dataclass
-class _Issue:
-    id: int
-    title: str
-    description: str
-    priority: str
-    status: Status
-    reporter: str
-    version: int
-    created_at: datetime
-    updated_at: datetime
-
-    def snapshot(self) -> dict:
-        return {
-            "id": self.id,
-            "title": self.title,
-            "description": self.description,
-            "priority": self.priority,
-            "status": self.status.value,
-            "reporter": self.reporter,
-            "version": self.version,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-        }
-
-
-@dataclass
-class _Reply:
-    id: int
-    author: str
-    body: str
-    created_at: datetime
-
-    def snapshot(self) -> dict:
-        return {
-            "id": self.id,
-            "author": self.author,
-            "body": self.body,
-            "created_at": self.created_at.isoformat(),
-        }
-
-
-@dataclass
-class _Comment:
-    id: int
-    author: str
-    body: str
-    created_at: datetime
-    replies: list[_Reply] = field(default_factory=list)
-
-    def snapshot(self) -> dict:
-        return {
-            "id": self.id,
-            "author": self.author,
-            "body": self.body,
-            "created_at": self.created_at.isoformat(),
-            "replies": [r.snapshot() for r in self.replies],
-        }
-
-
-@dataclass
-class _Project:
-    id: str
-    name: str
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    members: dict[str, Role] = field(default_factory=dict)
-    issues: dict[int, _Issue] = field(default_factory=dict)
-    # Issues are never deleted and IDs only grow, so insertion order == ID order.
-    # That makes "id > cursor" a stable keyset for pagination.
-    issue_ids: list[int] = field(default_factory=list)
-    next_issue_id: int = 1
-    # (actor, key) -> (request fingerprint, issue id)
-    idempotency: dict[tuple[str, str], tuple[str, int]] = field(default_factory=dict)
-    # issue id -> comments in creation order
-    comments: dict[int, list[_Comment]] = field(default_factory=dict)
-    comment_index: dict[int, tuple[int, _Comment]] = field(default_factory=dict)
-    next_comment_id: int = 1
-    next_reply_id: int = 1
+def _utcnow_ms() -> datetime:
+    # MongoDB keeps millisecond precision. Truncating here means both stores
+    # return exactly the timestamps they were given.
+    now = datetime.now(timezone.utc)
+    return now.replace(microsecond=now.microsecond // 1000 * 1000)
 
 
 class IssueService:
-    def __init__(self, clock: Callable[[], datetime] = _utcnow):
+    def __init__(self, store: Store | None = None, clock: Callable[[], datetime] = _utcnow_ms):
+        self._store: Store = store if store is not None else MemoryStore()
         self._clock = clock
-        self._registry_lock = threading.Lock()
-        self._projects: dict[str, _Project] = {}
 
     # ------------------------------------------------------------------ projects
 
@@ -158,12 +79,7 @@ class IssueService:
         actor = v.require_actor(actor)
         project_id = v.identifier(project_id, "project_id")
         name = v.text(name, "name", min_len=1, max_len=100)
-        with self._registry_lock:
-            if project_id in self._projects:
-                raise AlreadyExists("project already exists", project_id=project_id)
-            project = _Project(id=project_id, name=name)
-            project.members[actor] = Role.ADMIN
-            self._projects[project_id] = project
+        self._store.create_project(project_id, name, actor)
         return {"id": project_id, "name": name, "role": Role.ADMIN.value}
 
     def add_member(self, actor, project_id, user_id, role) -> dict:
@@ -175,11 +91,9 @@ class IssueService:
             raise ValidationError(
                 "role must be one of viewer, member, admin", field="role"
             ) from None
-        project = self._project_for(actor, project_id)
-        with project.lock:
-            self._require_role(project, actor, Role.ADMIN)
-            project.members[user_id] = role
-        return {"project_id": project.id, "user_id": user_id, "role": role.value}
+        project = self._authorize(actor, project_id, Role.ADMIN)
+        self._store.set_member(project["id"], user_id, role.value)
+        return {"project_id": project["id"], "user_id": user_id, "role": role.value}
 
     # -------------------------------------------------------------------- issues
 
@@ -206,47 +120,22 @@ class IssueService:
         key = v.idempotency_key(idempotency_key)
         fingerprint = _fingerprint(title=title, description=description, priority=priority)
 
-        project = self._project_for(actor, project_id)
-        with project.lock:
-            self._require_role(project, actor, Role.MEMBER)
-            if key is not None:
-                stored = project.idempotency.get((actor, key))
-                if stored is not None:
-                    stored_fingerprint, issue_id = stored
-                    if stored_fingerprint != fingerprint:
-                        raise IdempotencyConflict(
-                            "idempotency key was already used with a different request"
-                        )
-                    return project.issues[issue_id].snapshot(), False
-
-            now = self._clock()
-            issue = _Issue(
-                id=project.next_issue_id,
-                title=title,
-                description=description,
-                priority=priority,
-                status=Status.OPEN,
-                reporter=actor,
-                version=1,
-                created_at=now,
-                updated_at=now,
-            )
-            # All checks passed: commit every piece of state together.
-            project.next_issue_id += 1
-            project.issues[issue.id] = issue
-            project.issue_ids.append(issue.id)
-            project.comments[issue.id] = []
-            if key is not None:
-                project.idempotency[(actor, key)] = (fingerprint, issue.id)
-            return issue.snapshot(), True
+        project = self._authorize(actor, project_id, Role.MEMBER)
+        issue, created = self._store.create_issue(
+            project["id"],
+            actor,
+            {"title": title, "description": description, "priority": priority},
+            key,
+            fingerprint,
+            self._clock(),
+        )
+        return _issue_snapshot(issue), created
 
     def get_issue(self, actor, project_id, issue_id) -> dict:
         actor = v.require_actor(actor)
         issue_id = v.strict_int(issue_id, "issue_id", minimum=1)
-        project = self._project_for(actor, project_id)
-        with project.lock:
-            self._require_role(project, actor, Role.VIEWER)
-            return self._issue_in(project, issue_id).snapshot()
+        project = self._authorize(actor, project_id, Role.VIEWER)
+        return _issue_snapshot(self._issue_in(project["id"], issue_id))
 
     def transition(self, actor, project_id, issue_id, to_status, expected_version) -> dict:
         """Move an issue to a new status if ``expected_version`` is still current.
@@ -264,28 +153,29 @@ class IssueService:
                 "to must be one of " + ", ".join(s.value for s in Status), field="to"
             ) from None
 
-        project = self._project_for(actor, project_id)
-        with project.lock:
-            self._require_role(project, actor, Role.MEMBER)
-            issue = self._issue_in(project, issue_id)
-            if issue.version != expected_version:
-                raise VersionConflict(
-                    "issue was modified by someone else",
-                    expected_version=expected_version,
-                    current_version=issue.version,
-                )
-            if target not in TRANSITIONS[issue.status]:
-                raise InvalidTransition(
-                    f"cannot move issue from {issue.status.value} to {target.value}",
-                    current=issue.status.value,
-                    allowed=sorted(s.value for s in TRANSITIONS[issue.status]),
-                )
-            if issue.status is Status.CLOSED:
-                self._require_role(project, actor, Role.ADMIN)
-            issue.status = target
-            issue.version += 1
-            issue.updated_at = self._clock()
-            return issue.snapshot()
+        project = self._authorize(actor, project_id, Role.MEMBER)
+        issue = self._issue_in(project["id"], issue_id)
+        if issue["version"] != expected_version:
+            raise _conflict(expected_version, issue["version"])
+        current = Status(issue["status"])
+        if target not in TRANSITIONS[current]:
+            raise InvalidTransition(
+                f"cannot move issue from {current.value} to {target.value}",
+                current=current.value,
+                allowed=sorted(s.value for s in TRANSITIONS[current]),
+            )
+        if current is Status.CLOSED:
+            self._require_role(project, actor, Role.ADMIN)
+
+        # The store re-checks version *and* status atomically while applying the
+        # change, so a write that sneaks in after our read makes this fail.
+        updated = self._store.update_status(
+            project["id"], issue_id, expected_version, current.value, target.value, self._clock()
+        )
+        if updated is None:
+            latest = self._issue_in(project["id"], issue_id)
+            raise _conflict(expected_version, latest["version"])
+        return _issue_snapshot(updated)
 
     def list_issues(self, actor, project_id, limit=20, cursor=None, status=None) -> dict:
         """Keyset pagination ordered by issue id (= creation order).
@@ -302,29 +192,20 @@ class IssueService:
             except ValueError:
                 raise ValidationError("unknown status filter", field="status") from None
 
-        project = self._project_for(actor, project_id)
+        project = self._authorize(actor, project_id, Role.VIEWER)
         after = 0
         if cursor is not None:
-            after = _decode_cursor(cursor, project.id, status_filter)
+            after = _decode_cursor(cursor, project["id"], status_filter)
 
-        with project.lock:
-            self._require_role(project, actor, Role.VIEWER)
-            ids = project.issue_ids
-            start = _first_index_after(ids, after)
-            page: list[dict] = []
-            last_seen = None
-            has_more = False
-            for idx in range(start, len(ids)):
-                issue = project.issues[ids[idx]]
-                if status_filter is not None and issue.status is not status_filter:
-                    continue
-                if len(page) == limit:
-                    has_more = True
-                    break
-                page.append(issue.snapshot())
-                last_seen = issue.id
-
-        next_cursor = _encode_cursor(project.id, status_filter, last_seen) if has_more else None
+        # Ask for one extra row to learn whether another page exists.
+        rows = self._store.list_issues(
+            project["id"], after, status_filter.value if status_filter else None, limit + 1
+        )
+        has_more = len(rows) > limit
+        page = [_issue_snapshot(r) for r in rows[:limit]]
+        next_cursor = (
+            _encode_cursor(project["id"], status_filter, page[-1]["id"]) if has_more else None
+        )
         return {"items": page, "next_cursor": next_cursor}
 
     # ------------------------------------------------------------------ comments
@@ -333,17 +214,10 @@ class IssueService:
         actor = v.require_actor(actor)
         issue_id = v.strict_int(issue_id, "issue_id", minimum=1)
         body = v.text(body, "body", min_len=1, max_len=5_000)
-        project = self._project_for(actor, project_id)
-        with project.lock:
-            self._require_role(project, actor, Role.MEMBER)
-            self._issue_in(project, issue_id)
-            comment = _Comment(
-                id=project.next_comment_id, author=actor, body=body, created_at=self._clock()
-            )
-            project.next_comment_id += 1
-            project.comments[issue_id].append(comment)
-            project.comment_index[comment.id] = (issue_id, comment)
-            return comment.snapshot()
+        project = self._authorize(actor, project_id, Role.MEMBER)
+        self._issue_in(project["id"], issue_id)
+        comment = self._store.add_comment(project["id"], issue_id, actor, body, self._clock())
+        return _comment_snapshot(comment)
 
     def add_reply(self, actor, project_id, issue_id, comment_id, body) -> dict:
         """Reply to a top-level comment. Threads are exactly two levels deep."""
@@ -351,52 +225,42 @@ class IssueService:
         issue_id = v.strict_int(issue_id, "issue_id", minimum=1)
         comment_id = v.strict_int(comment_id, "comment_id", minimum=1)
         body = v.text(body, "body", min_len=1, max_len=5_000)
-        project = self._project_for(actor, project_id)
-        with project.lock:
-            self._require_role(project, actor, Role.MEMBER)
-            self._issue_in(project, issue_id)
-            found = project.comment_index.get(comment_id)
-            # A comment ID from a different issue is treated as missing.
-            if found is None or found[0] != issue_id:
-                raise NotFound("comment not found", comment_id=comment_id)
-            reply = _Reply(
-                id=project.next_reply_id, author=actor, body=body, created_at=self._clock()
-            )
-            project.next_reply_id += 1
-            found[1].replies.append(reply)
-            return reply.snapshot()
+        project = self._authorize(actor, project_id, Role.MEMBER)
+        self._issue_in(project["id"], issue_id)
+        reply = self._store.add_reply(
+            project["id"], issue_id, comment_id, actor, body, self._clock()
+        )
+        # A comment ID from a different issue is treated as missing.
+        if reply is None:
+            raise NotFound("comment not found", comment_id=comment_id)
+        return _reply_snapshot(reply)
 
     def get_thread(self, actor, project_id, issue_id) -> list[dict]:
         actor = v.require_actor(actor)
         issue_id = v.strict_int(issue_id, "issue_id", minimum=1)
-        project = self._project_for(actor, project_id)
-        with project.lock:
-            self._require_role(project, actor, Role.VIEWER)
-            self._issue_in(project, issue_id)
-            return [c.snapshot() for c in project.comments[issue_id]]
+        project = self._authorize(actor, project_id, Role.VIEWER)
+        self._issue_in(project["id"], issue_id)
+        return [_comment_snapshot(c) for c in self._store.get_thread(project["id"], issue_id)]
 
     # ------------------------------------------------------------------- helpers
 
-    def _project_for(self, actor: str, project_id) -> _Project:
+    def _authorize(self, actor: str, project_id, minimum: Role) -> dict:
         project_id = v.identifier(project_id, "project_id")
-        with self._registry_lock:
-            project = self._projects.get(project_id)
+        project = self._store.get_project(project_id)
         # Same error for "missing" and "not a member": don't leak existence.
-        if project is None or actor not in project.members:
+        if project is None or actor not in project["members"]:
             raise NotFound("project not found", project_id=project_id)
+        self._require_role(project, actor, minimum)
         return project
 
     @staticmethod
-    def _require_role(project: _Project, actor: str, minimum: Role) -> None:
-        role = project.members.get(actor)
-        if role is None:
-            raise NotFound("project not found", project_id=project.id)
+    def _require_role(project: dict, actor: str, minimum: Role) -> None:
+        role = Role(project["members"][actor])
         if _ROLE_RANK[role] < _ROLE_RANK[minimum]:
             raise PermissionDenied(f"requires {minimum.value} role", role=role.value)
 
-    @staticmethod
-    def _issue_in(project: _Project, issue_id: int) -> _Issue:
-        issue = project.issues.get(issue_id)
+    def _issue_in(self, project_id: str, issue_id: int) -> dict:
+        issue = self._store.get_issue(project_id, issue_id)
         if issue is None:
             raise NotFound("issue not found", issue_id=issue_id)
         return issue
@@ -405,21 +269,54 @@ class IssueService:
 # ----------------------------------------------------------------- module helpers
 
 
+def _conflict(expected: int, current: int) -> VersionConflict:
+    return VersionConflict(
+        "issue was modified by someone else", expected_version=expected, current_version=current
+    )
+
+
+def _iso(value: datetime) -> str:
+    if value.tzinfo is None:  # defensive: treat naive values as UTC
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _issue_snapshot(issue: dict) -> dict:
+    return {
+        "id": issue["id"],
+        "title": issue["title"],
+        "description": issue["description"],
+        "priority": issue["priority"],
+        "status": issue["status"],
+        "reporter": issue["reporter"],
+        "version": issue["version"],
+        "created_at": _iso(issue["created_at"]),
+        "updated_at": _iso(issue["updated_at"]),
+    }
+
+
+def _reply_snapshot(reply: dict) -> dict:
+    return {
+        "id": reply["id"],
+        "author": reply["author"],
+        "body": reply["body"],
+        "created_at": _iso(reply["created_at"]),
+    }
+
+
+def _comment_snapshot(comment: dict) -> dict:
+    return {
+        "id": comment["id"],
+        "author": comment["author"],
+        "body": comment["body"],
+        "created_at": _iso(comment["created_at"]),
+        "replies": [_reply_snapshot(r) for r in comment["replies"]],
+    }
+
+
 def _fingerprint(**fields) -> str:
     canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def _first_index_after(ids: list[int], after: int) -> int:
-    """Binary search: index of the first id strictly greater than ``after``."""
-    lo, hi = 0, len(ids)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if ids[mid] <= after:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
 
 
 def _encode_cursor(project_id: str, status: Status | None, after: int) -> str:
